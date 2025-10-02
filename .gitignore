@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Experiment artifacts
+outputs/
+d3rlpy_logs/
+logs/
+results/
+docs/
+
+# Datasets and checkpoints
+data/
+*.pt
+*.pth
+*.ckpt
+
+# Misc
+*.log
+.DS_Store

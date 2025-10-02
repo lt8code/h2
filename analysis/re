@@ -1,0 +1,189 @@
+# Hydrogen Production RL Project
+
+This repository contains a lightweight research environment for developing offline
+reinforcement learning (RL) agents that maintain a stable hydrogen production
+rate in a solid-oxide electrolysis setup. The workflow mirrors the
+Advantage-Weighted Actor Critic (AWAC) approach described in the project slides
+and encapsulates three key pieces:
+
+1. **A physics-inspired simulator** built from interpolated V–I–T data.
+2. **Offline dataset generation** with a heuristic controller.
+3. **Offline RL training & evaluation** using [d3rlpy](https://github.com/takuseno/d3rlpy).
+
+The goal is to help new contributors understand how the pieces fit together so
+they can iterate on reward shaping, action spaces, and policy training.
+
+---
+
+## Quick Start
+
+```bash
+# 1. Activate your Python environment that already has d3rlpy installed.
+conda activate rl_env_py38  # example
+
+# 2. Train and evaluate AWAC in one command.
+python train_awac.py \
+  --episodes 800 \
+  --steps 100000 \
+  --output outputs/awac_runs \
+  --eval-episodes 5 \
+  --eval-noise 0.002
+```
+
+The command will:
+- regenerate `offline_dataset.npz` if it does not exist (800 heuristic episodes),
+- run 100k AWAC gradient steps on the offline buffer,
+- save the trained policy to `awac_runs/awac_model.pt`, and
+- print an evaluation summary (reward, current error, start/end operating point).
+
+Logs and intermediate metrics land in `d3rlpy_logs/`.
+
+---
+
+## Repository Layout
+
+| Path | Purpose |
+|---|---|
+| `hydrogen_env.py` | Simulator wrapping the interpolated physics table, reward shaping, and action handling. |
+| `build_offline_dataset.py` | Generates heuristic rollouts and stores them in `.npz` format for d3rlpy. |
+| `train_awac.py` | High-level driver that ensures data, trains AWAC, and runs evaluation episodes. |
+| `data/interpolated_hydrogen_data.csv` | Lookup table mapping temperature/voltage/current (derived from lab data & physics). |
+| `data/datasets/` | Offline replay buffers produced by the heuristic policy (e.g., `offline_dataset.npz`). |
+| `docs/` | Project background materials (slides, OCR’d PDF). |
+| `outputs/` | Training artefacts: checkpoints (`awac_runs/`, `awac_quick/`, …) and `d3rlpy_logs/`. |
+
+---
+
+## Physics & Data Background
+
+The process model relies on the relationships outlined in the slides:
+
+- **Ohm's Law:** `I = V / R`
+- **Arrhenius Temperature Dependence:** `R = A * exp(E_a / (R̄ * T))`
+- Production rate is proportional to current (Ah/h ≈ current).
+
+`interpolated_hydrogen_data.csv` enumerates current values across a grid of
+temperatures (700–850 °C) and currents (0.5–3.0 A in 0.01 A increments) with the
+corresponding voltages. The simulator interpolates within this grid to approximate
+electrolyzer behaviour after each control action.
+
+---
+
+## HydrogenEnv Simulator (`hydrogen_env.py`)
+
+### Observations
+`[temperature, voltage, current, resistance, current_error, delta_current]`
+- `resistance = voltage / current`
+- `current_error = current - target_current` (kept for diagnostics)
+- `delta_current` is the change since the previous step and now drives the reward.
+
+### Actions
+Continuous 2-D vector `[Δtemp, Δvoltage]` with each dimension ∈ [-1, 1].
+- The first component maps to ±5 °C temperature steps.
+- The second component maps to ±0.05 V voltage steps.
+- Discrete actions `{hold, temp±, volt±}` are mapped internally to the same vector.
+
+### Reward (current version)
+- Base term `1 - (|Δcurrent| / tolerance)^2` encourages consecutive steps to
+  produce similar hydrogen output.
+- Penalties for large moves, lingering on temperature/voltage limits, and
+  extreme swings (>5× tolerance) discourage degenerate behaviour.
+- Rewards are clipped to [-10, 1].
+
+### Key Parameters
+- `target_current`: initialised to 0.93 A for the first reset, then re-set to the
+  episode’s starting current so drift is measured relative to the recent baseline.
+- `tolerance`: default 0.01 A (matching the specification’s ±0.01 Ah/h band).
+- `max_steps`: 96 (roughly four days of hourly decisions as illustrated in slides).
+- `current_noise`: optional Gaussian noise for evaluation robustness.
+
+The environment returns `info` entries containing the current error ratio and the
+applied action vector which are useful for diagnostics.
+
+---
+
+## Offline Dataset Generation (`build_offline_dataset.py`)
+
+The script uses a `HeuristicPolicy` that mimics domain knowledge:
+- Increase voltage or temperature when production is too low.
+- Reduce voltage or temperature when production is too high.
+- Occasionally explore via random actions.
+
+Usage:
+```bash
+python build_offline_dataset.py --episodes 400 --output offline_dataset.npz
+```
+
+The `.npz` file contains NumPy arrays: `observations`, `actions`, `rewards`,
+`next_observations`, `terminals`. These feed directly into `d3rlpy.dataset.MDPDataset`.
+Heuristic rolls also serve as a baseline for expected reward magnitudes.
+
+---
+
+## Training & Evaluation (`train_awac.py`)
+
+### Workflow
+1. **ensure_dataset** – Generates the offline buffer if it is missing.
+2. **load_dataset** – Wraps the arrays with `MDPDataset` (continuous action space).
+3. **train_awac** – Builds an AWAC learner and performs mini-batch updates.
+4. **evaluate_awac** – Runs a configurable number of simulator rollouts using the trained policy.
+
+Important arguments:
+- `--episodes`: number of heuristic episodes to generate when creating a dataset.
+- `--steps`: gradient steps (`n_steps`) for AWAC.
+- `--batch-size`: AWAC mini-batch size (default 256).
+- `--eval-episodes`: number of post-training evaluation rollouts.
+- `--eval-noise`: standard deviation of injected current noise during evaluation.
+- `--skip-eval`: disable evaluation if you only need the trained model.
+
+### Output
+Each evaluation episode prints:
+```
+Episode k: reward=..., final error=... A,
+start (T=...C, V=... V) -> end (T=...C, V=... V)
+```
+Large negative rewards or large absolute errors usually indicate the policy
+pushed to temperature/voltage bounds—adjust reward shaping or training horizon
+as needed.
+
+---
+
+## Suggested Development Path
+
+1. **Baseline:** run the quick-start command to reproduce current behaviour.
+2. **Reward Shaping:** tweak coefficients in `HydrogenEnv.step` and re-train.
+3. **Action Space:** experiment with continuous action scaling (e.g., smaller
+   voltage steps) and adjust `HeuristicPolicy` accordingly.
+4. **Dataset Coverage:** increase `--episodes` or craft targeted rollouts to
+   cover challenging regions.
+5. **Evaluation Noise:** use `--eval-noise` to test robustness to sensor noise.
+6. **Model Variants:** d3rlpy also offers Discrete AWAC, CQL, CRR, etc.—swap the
+   algo in `train_awac.py` for comparison.
+
+---
+
+## Troubleshooting
+
+- **Warnings about Gym:** d3rlpy emits the Gym deprecation warning when imported.
+  Our workflow uses `gymnasium`-compatible components, so the warning can be ignored.
+- **Divergence / Huge Losses:** If `critic_loss` and `actor_loss` explode, reduce
+  the learning rate or increase reward clipping.
+- **Degenerate Policies:** If evaluation shows saturation at bounds, increase
+  bound penalties or tighten the exploration policy that generates the dataset.
+- **Slow Training:** `--steps` = 100k typically finishes within a few minutes on CPU.
+  Larger datasets may require adjusting `batch_size` or using GPU (`device='cuda'`).
+
+---
+
+## Next Steps for New Contributors
+
+- Add unit-style tests covering reward calculations and action clipping.
+- Build dashboards (TensorBoard, matplotlib) to analyze training curves in
+  `d3rlpy_logs/.../progress.csv`.
+- Integrate real experimental data once available, replacing
+  `interpolated_hydrogen_data.csv`.
+- Prototype online fine-tuning by swapping in a Gymnasium-compatible environment
+  and using d3rlpy's online agents.
+
+Feel free to reach out to the project maintainer for more context or to propose
+changes to the reward structure, heuristics, or training configuration.
